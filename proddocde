@@ -1,0 +1,1644 @@
+from fastapi import FastAPI, APIRouter, HTTPException, Body
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+import os
+import logging
+from pathlib import Path
+from pydantic import BaseModel, Field
+from typing import Dict, Any, List, Optional
+import uuid
+from datetime import datetime
+import pandas as pd
+import google.generativeai as genai
+import json
+import re
+from enum import Enum
+
+# --- Environment and Configuration ---
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+# MongoDB connection
+MONGO_URL = os.environ.get('MONGO_URL')
+if not MONGO_URL:
+    raise ValueError("MONGO_URL environment variable not set.")
+client = AsyncIOMotorClient(MONGO_URL)
+db = client.get_database("analog_agent")
+
+# Configure Google AI
+try:
+    # Try emergent integrations first if available
+    try:
+        from emergentintegrations import get_universal_key
+        GOOGLE_AI_API_KEY = get_universal_key()
+        genai.configure(api_key=GOOGLE_AI_API_KEY)
+        print("✅ Configured Google AI with Emergent Universal Key")
+    except ImportError:
+        print("ℹ️ emergentintegrations not available, using environment key")
+        GOOGLE_AI_API_KEY = os.environ.get('GOOGLE_AI_API_KEY')
+        if GOOGLE_AI_API_KEY:
+            genai.configure(api_key=GOOGLE_AI_API_KEY)
+            print("✅ Configured Google AI with environment key")
+        else:
+            raise ValueError("No Google AI API key available")
+except Exception as e:
+    print(f"❌ Google AI configuration failed: {e}")
+    raise ValueError("Google AI configuration failed")
+
+# Initialize the generative model with market access expertise
+model = genai.GenerativeModel(
+    model_name='gemini-1.5-flash',
+    system_instruction=(
+        "You are an expert Market Access and Pharmaceutical Benchmarking Agent with deep knowledge of payer behavior, "
+        "formulary positioning, and access barriers. Your core expertise is identifying pharmaceutical analogs based on "
+        "similar ACCESS and PAYER PERCEPTION profiles.\n\n"
+        "DATASET STRUCTURE EXPERTISE:\n"
+        "• brand_name: Primary product identifier\n"
+        "• ndc_data: Nested JSON with route, dosage_form, generic_name, labeler_name, marketing_category\n"
+        "• indication: Primary medical condition\n"
+        "• annual_WAC: Annual wholesale acquisition cost (key payer factor)\n"
+        "• Is Boxed Warning: Safety profile impact on payer perception\n"
+        "• CTCAE Term/Grade: Adverse event profile affecting access\n"
+        "• 505b2_status: Regulatory pathway impacting payer positioning\n"
+        "• dosing_schedule, treatment_duration: Administration complexity\n\n"
+        "MARKET ACCESS INTELLIGENCE:\n"
+        "Focus on factors that create similar payer challenges/advantages:\n"
+        "• Price tiers and affordability barriers\n"
+        "• Safety profiles and restriction requirements\n"
+        "• Administration complexity affecting coverage\n"
+        "• Regulatory pathways influencing payer confidence\n"
+        "• Therapeutic positioning and competition\n\n"
+        "Always explain your analog reasoning from a market access perspective. Be data-driven and transparent."
+    )
+)
+
+# Create the main app and router
+app = FastAPI(
+    title="Intelligent Market Access Analog Agent - 7 Stage Workflow",
+    description="Structured 7-stage workflow for pharmaceutical analog discovery with market access intelligence."
+)
+api_router = APIRouter(prefix="/api")
+
+# --- Workflow Stages ---
+class Stage(str, Enum):
+    STAGE_1_INTENT_ALIGNMENT = "stage_1_intent_alignment"
+    STAGE_2_DATA_RETRIEVAL = "stage_2_data_retrieval"
+    STAGE_3_INITIAL_RANKING = "stage_3_initial_ranking"
+    STAGE_4_FEEDBACK_LOOP_1 = "stage_4_feedback_loop_1"
+    STAGE_5_SECONDARY_REFINEMENT = "stage_5_secondary_refinement"
+    STAGE_6_FINAL_SELECTION = "stage_6_final_selection"
+    STAGE_7_FINAL_ANALYSIS = "stage_7_final_analysis"
+
+# --- Pydantic Models ---
+class MarketAccessQuery(BaseModel):
+    query_text: str = Field(..., description="Natural language query for analog discovery")
+    query_type: str = Field(default="natural_language", description="Type of query")
+
+class MarketAccessPreference(BaseModel):
+    attribute: str = Field(..., description="Market access attribute")
+    preference_value: str = Field(..., description="Preferred value")
+    weight: float = Field(..., description="Importance weight")
+    rationale: str = Field(..., description="Reasoning for this preference")
+
+class AnalogRanking(BaseModel):
+    product_id: str
+    brand_name: str
+    market_access_similarity: float
+    access_reasoning: str
+    key_attributes: Dict[str, Any]
+    payer_considerations: List[str]
+
+class AnalogSession(BaseModel):
+    session_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    stage: Stage = Field(default=Stage.STAGE_1_INTENT_ALIGNMENT)
+    
+    # Query and preferences
+    queries: List[MarketAccessQuery] = Field(default_factory=list)
+    market_access_preferences: List[Dict[str, Any]] = Field(default_factory=list)
+    
+    # Workflow data
+    candidate_count: int = 0
+    initial_rankings: List[Dict[str, Any]] = Field(default_factory=list)
+    user_selections: List[str] = Field(default_factory=list)
+    user_rejections: List[str] = Field(default_factory=list)
+    
+    # Analysis results
+    ranking_rationale: str = ""
+    final_insights: str = ""
+
+# --- Data Loading with Market Access Intelligence ---
+class DatasetIntelligence:
+    def __init__(self):
+        self.df = None
+        self.columns_analyzed = False
+        self.ndc_structure = {}
+        self.load_dataset()
+    
+    def load_dataset(self):
+        """Load and analyze the pharmaceutical dataset"""
+        try:
+            self.df = pd.read_excel('/app/pharmaceutical_dataset.xlsx')
+            print(f"✅ Loaded pharmaceutical dataset with {len(self.df)} products")
+            print(f"📊 Dataset columns: {list(self.df.columns)}")
+            self.analyze_dataset_structure()
+        except Exception as e:
+            print(f"❌ Error loading dataset: {e}")
+            self.df = pd.DataFrame()
+    
+    def analyze_dataset_structure(self):
+        """Deep analysis of dataset structure including nested data"""
+        if self.df is None or self.df.empty:
+            return
+        
+        print("\n🔍 DATASET STRUCTURE ANALYSIS:")
+        
+        # Analyze each column
+        for col in self.df.columns:
+            non_null_count = self.df[col].notna().sum()
+            coverage = (non_null_count / len(self.df)) * 100
+            print(f"  • {col}: {non_null_count}/{len(self.df)} ({coverage:.1f}% coverage)")
+            
+            # Special analysis for NDC data
+            if col == 'ndc_data':
+                self.analyze_ndc_structure()
+        
+        # Analyze price distribution for market access insights
+        self.analyze_price_distribution()
+        self.columns_analyzed = True
+    
+    def analyze_ndc_structure(self):
+        """Analyze the nested NDC data structure"""
+        try:
+            sample_ndc = None
+            for idx in self.df.index:
+                ndc_val = self.df.loc[idx, 'ndc_data']
+                if pd.notna(ndc_val) and str(ndc_val).strip():
+                    try:
+                        sample_ndc = json.loads(str(ndc_val))
+                        break
+                    except:
+                        continue
+            
+            if sample_ndc and isinstance(sample_ndc, list) and len(sample_ndc) > 0:
+                ndc_fields = sample_ndc[0].keys() if isinstance(sample_ndc[0], dict) else []
+                print(f"  📦 NDC nested fields: {list(ndc_fields)}")
+                self.ndc_structure = {field: True for field in ndc_fields}
+            else:
+                print("  ⚠️ NDC data structure analysis incomplete")
+        except Exception as e:
+            print(f"  ❌ NDC analysis error: {e}")
+    
+    def analyze_price_distribution(self):
+        """Analyze pricing for market access tiers"""
+        try:
+            if 'annual_WAC' in self.df.columns:
+                # Use pandas to_numeric with error handling
+                prices = pd.to_numeric(self.df['annual_WAC'], errors='coerce').dropna()
+                if len(prices) > 0:
+                    print(f"  💰 Price range: ${prices.min():,.0f} - ${prices.max():,.0f}")
+                    print(f"     Median: ${prices.median():,.0f}")
+                    
+                    # Define access tiers
+                    low_cost = (prices <= 5000).sum()
+                    mid_cost = ((prices > 5000) & (prices <= 50000)).sum()
+                    high_cost = (prices > 50000).sum()
+                    
+                    print(f"     Access Tiers: Low(≤$5K): {low_cost}, Mid($5K-$50K): {mid_cost}, High(>$50K): {high_cost}")
+                else:
+                    print("  ⚠️ No valid pricing data found")
+        except Exception as e:
+            print(f"  ❌ Price analysis error: {e}")
+
+# Initialize dataset intelligence
+dataset_intel = DatasetIntelligence()
+
+# --- Market Access Intelligence Engine ---
+class MarketAccessIntelligence:
+    def __init__(self, dataset_intel: DatasetIntelligence):
+        self.dataset = dataset_intel
+        self.df = dataset_intel.df
+    
+    def safe_extract_price(self, price_value) -> float:
+        """Safely extract numeric price from various formats"""
+        import math
+        try:
+            if pd.isna(price_value):
+                return 0.0
+            
+            # Handle string prices like "$54,896.00"
+            if isinstance(price_value, str):
+                # Remove currency symbols and commas
+                cleaned = price_value.replace('$', '').replace(',', '').strip()
+                if cleaned.lower() in ['nan', 'none', '']:
+                    return 0.0
+                result = float(cleaned)
+                # Check for NaN or infinity
+                if math.isnan(result) or math.isinf(result):
+                    return 0.0
+                return max(0.0, result)  # Ensure non-negative
+            
+            # Handle lists (take first valid value)
+            if isinstance(price_value, list):
+                for item in price_value:
+                    result = self.safe_extract_price(item)
+                    if result > 0:
+                        return result
+                return 0.0
+            
+            # Direct numeric conversion
+            result = float(price_value)
+            # Check for NaN or infinity
+            if math.isnan(result) or math.isinf(result):
+                return 0.0
+            return max(0.0, result)  # Ensure non-negative
+            
+        except (ValueError, TypeError):
+            return 0.0
+
+    def extract_comprehensive_product_data(self, product: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract comprehensive product data from all available fields"""
+        comprehensive_data = {}
+        
+        # Basic product info
+        comprehensive_data['brand_name'] = product.get('brand_name', 'Unknown')
+        comprehensive_data['generic_name'] = ''
+        comprehensive_data['therapeutic_area'] = ''
+        comprehensive_data['route'] = ''
+        comprehensive_data['dosage_form'] = ''
+        comprehensive_data['pharm_class'] = ''
+        comprehensive_data['labeler_name'] = ''
+        comprehensive_data['marketing_category'] = ''
+        
+        # Extract NDC data
+        try:
+            ndc_data_str = product.get('ndc_data', '')
+            if pd.notna(ndc_data_str) and str(ndc_data_str).strip():
+                # Use eval for complex nested data (safer than json.loads for this format)
+                import ast
+                ndc_data = ast.literal_eval(str(ndc_data_str))
+                
+                if isinstance(ndc_data, dict):
+                    # Get first NDC entry
+                    first_ndc_key = list(ndc_data.keys())[0]
+                    ndc_info = ndc_data[first_ndc_key]
+                    
+                    # Extract key fields
+                    comprehensive_data['generic_name'] = self._extract_list_value(ndc_info.get('generic_name', []))
+                    comprehensive_data['route'] = self._clean_route_data(ndc_info.get('route', []))
+                    comprehensive_data['dosage_form'] = self._extract_list_value(ndc_info.get('dosage_form', []))
+                    comprehensive_data['labeler_name'] = self._extract_list_value(ndc_info.get('labeler_name', []))
+                    comprehensive_data['marketing_category'] = self._extract_list_value(ndc_info.get('marketing_category', []))
+                    comprehensive_data['pharm_class'] = self._extract_list_value(ndc_info.get('pharm_class', []))
+                    comprehensive_data['therapeutic_area'] = self._extract_list_value(ndc_info.get('therapeutic_area', []))
+                    
+                    # Launch recency from marketing_start_date
+                    start_date = ndc_info.get('marketing_start_date', [])
+                    if start_date:
+                        try:
+                            date_val = start_date[0] if isinstance(start_date, list) else start_date
+                            if isinstance(date_val, (int, float)):
+                                # Convert from format like 20191013 to year
+                                year = int(str(int(date_val))[:4])
+                                comprehensive_data['launch_year'] = year
+                                current_year = 2024
+                                comprehensive_data['years_since_launch'] = current_year - year
+                                comprehensive_data['launch_recency'] = 'Recent' if (current_year - year) <= 5 else 'Established'
+                            else:
+                                comprehensive_data['launch_recency'] = 'Unknown'
+                        except:
+                            comprehensive_data['launch_recency'] = 'Unknown'
+                    else:
+                        comprehensive_data['launch_recency'] = 'Unknown'
+        except Exception as e:
+            print(f"NDC extraction error: {e}")
+        
+        # Extract indication data
+        indication_data = product.get('indication', '')
+        if pd.notna(indication_data):
+            try:
+                if isinstance(indication_data, str) and indication_data.startswith('['):
+                    indications = ast.literal_eval(indication_data)
+                    comprehensive_data['indications'] = indications if isinstance(indications, list) else [str(indications)]
+                else:
+                    comprehensive_data['indications'] = [str(indication_data)]
+            except:
+                comprehensive_data['indications'] = [str(indication_data)] if indication_data else []
+        else:
+            comprehensive_data['indications'] = []
+        
+        # Extract pricing data
+        annual_wac = product.get('annual_WAC', '')
+        if pd.notna(annual_wac):
+            try:
+                if isinstance(annual_wac, str) and annual_wac.startswith('['):
+                    wac_list = ast.literal_eval(annual_wac)
+                    # Get first valid price
+                    for price in wac_list:
+                        if price and str(price) != '$nan':
+                            comprehensive_data['annual_wac_raw'] = price
+                            comprehensive_data['annual_wac_numeric'] = self.safe_extract_price(price)
+                            break
+                else:
+                    comprehensive_data['annual_wac_raw'] = annual_wac
+                    comprehensive_data['annual_wac_numeric'] = self.safe_extract_price(annual_wac)
+            except:
+                comprehensive_data['annual_wac_raw'] = annual_wac
+                comprehensive_data['annual_wac_numeric'] = self.safe_extract_price(annual_wac)
+        else:
+            comprehensive_data['annual_wac_raw'] = 'Not available'
+            comprehensive_data['annual_wac_numeric'] = 0
+        
+        # Extract safety data
+        ctcae_terms = product.get('CTCAE Term', '')
+        ctcae_grades = product.get('CTCAE Grade', '')
+        boxed_warning = product.get('Is Boxed Warning', '')
+        
+        if pd.notna(ctcae_terms):
+            try:
+                terms = ast.literal_eval(ctcae_terms) if isinstance(ctcae_terms, str) else ctcae_terms
+                comprehensive_data['adverse_events'] = terms if isinstance(terms, list) else [str(terms)]
+            except:
+                comprehensive_data['adverse_events'] = []
+        else:
+            comprehensive_data['adverse_events'] = []
+        
+        if pd.notna(ctcae_grades):
+            try:
+                grades = ast.literal_eval(ctcae_grades) if isinstance(ctcae_grades, str) else ctcae_grades
+                comprehensive_data['severity_grades'] = grades if isinstance(grades, list) else [str(grades)]
+                # Calculate safety score (lower is better)
+                if isinstance(grades, list):
+                    numeric_grades = [int(g) for g in grades if str(g).isdigit()]
+                    if numeric_grades:
+                        comprehensive_data['safety_score'] = sum(numeric_grades) / len(numeric_grades)
+                    else:
+                        comprehensive_data['safety_score'] = 0
+                else:
+                    comprehensive_data['safety_score'] = 0
+            except:
+                comprehensive_data['severity_grades'] = []
+                comprehensive_data['safety_score'] = 0
+        else:
+            comprehensive_data['severity_grades'] = []
+            comprehensive_data['safety_score'] = 0
+        
+        if pd.notna(boxed_warning):
+            try:
+                warning_data = ast.literal_eval(boxed_warning) if isinstance(boxed_warning, str) else boxed_warning
+                if isinstance(warning_data, list):
+                    # Check if any entry is True
+                    comprehensive_data['has_boxed_warning'] = any(w == True for w in warning_data if w is not None)
+                else:
+                    comprehensive_data['has_boxed_warning'] = bool(warning_data)
+            except:
+                comprehensive_data['has_boxed_warning'] = False
+        else:
+            comprehensive_data['has_boxed_warning'] = False
+        
+        # Extract regulatory data
+        regulatory_status = product.get('505b2_status', '')
+        if pd.notna(regulatory_status):
+            try:
+                if isinstance(regulatory_status, str) and regulatory_status.startswith('['):
+                    status_list = ast.literal_eval(regulatory_status)
+                    comprehensive_data['regulatory_pathway'] = 'NDA' if '0' in status_list else '505(b)(2)' if '1' in status_list else 'Unknown'
+                else:
+                    comprehensive_data['regulatory_pathway'] = '505(b)(2)' if '1' in str(regulatory_status) else 'NDA'
+            except:
+                comprehensive_data['regulatory_pathway'] = 'Unknown'
+        else:
+            comprehensive_data['regulatory_pathway'] = 'Unknown'
+        
+        # Extract event data for multi-indication analysis
+        event_dates = product.get('event_date', '')
+        event_descriptions = product.get('event_description', '')
+        event_types = product.get('event_type', '')
+        
+        comprehensive_data['regulatory_events'] = []
+        if pd.notna(event_descriptions):
+            try:
+                if isinstance(event_descriptions, str) and event_descriptions.startswith('['):
+                    descriptions = ast.literal_eval(event_descriptions)
+                    comprehensive_data['regulatory_events'] = descriptions if isinstance(descriptions, list) else [str(descriptions)]
+                    comprehensive_data['is_multi_indication'] = len(comprehensive_data['regulatory_events']) > 3  # Multiple approvals suggest multi-indication
+                else:
+                    comprehensive_data['regulatory_events'] = [str(event_descriptions)]
+                    comprehensive_data['is_multi_indication'] = False
+            except:
+                comprehensive_data['regulatory_events'] = []
+                comprehensive_data['is_multi_indication'] = False
+        else:
+            comprehensive_data['regulatory_events'] = []
+            comprehensive_data['is_multi_indication'] = False
+        
+        return comprehensive_data
+    
+    def _extract_list_value(self, value):
+        """Helper to extract first valid value from list or return string"""
+        if isinstance(value, list) and len(value) > 0:
+            return str(value[0]) if value[0] is not None else ''
+        return str(value) if value is not None else ''
+    
+    def _clean_route_data(self, route_data):
+        """Clean route data which may be nested"""
+        if isinstance(route_data, list) and len(route_data) > 0:
+            route_str = str(route_data[0])
+            # Handle nested route format like "['ORAL']"
+            if route_str.startswith('[') and route_str.endswith(']'):
+                try:
+                    import ast
+                    inner_list = ast.literal_eval(route_str)
+                    return inner_list[0] if isinstance(inner_list, list) and len(inner_list) > 0 else route_str
+                except:
+                    return route_str.strip("[]'\"")
+            return route_str
+        return str(route_data) if route_data else ''
+    
+    def extract_ndc_info(self, ndc_data_str: str) -> Dict[str, Any]:
+        """Extract NDC information from ndc_data string"""
+        ndc_info = {
+            'route': '',
+            'dosage_form': '',
+            'generic_name': '',
+            'labeler_name': '',
+            'marketing_category': '',
+            'pharm_class': ''
+        }
+        
+        try:
+            if pd.notna(ndc_data_str) and str(ndc_data_str).strip():
+                import ast
+                ndc_data = ast.literal_eval(str(ndc_data_str))
+                
+                if isinstance(ndc_data, dict):
+                    # Get first NDC entry
+                    first_ndc_key = list(ndc_data.keys())[0]
+                    ndc_entry = ndc_data[first_ndc_key]
+                    
+                    # Extract key fields
+                    ndc_info['generic_name'] = self._extract_list_value(ndc_entry.get('generic_name', []))
+                    ndc_info['route'] = self._clean_route_data(ndc_entry.get('route', []))
+                    ndc_info['dosage_form'] = self._extract_list_value(ndc_entry.get('dosage_form', []))
+                    ndc_info['labeler_name'] = self._extract_list_value(ndc_entry.get('labeler_name', []))
+                    ndc_info['marketing_category'] = self._extract_list_value(ndc_entry.get('marketing_category', []))
+                    ndc_info['pharm_class'] = self._extract_list_value(ndc_entry.get('pharm_class', []))
+                    
+        except Exception as e:
+            print(f"NDC extraction error: {e}")
+        
+        return ndc_info
+    
+    def find_relevant_products(self, preferences: List[MarketAccessPreference]) -> List[Dict[str, Any]]:
+        """Find relevant products based on market access preferences"""
+        return self.apply_primary_filtering(preferences)
+    
+    async def parse_intelligent_query(self, query_text: str) -> List[MarketAccessPreference]:
+        """Intelligently parse query with market access focus"""
+        try:
+            # Enhanced medical domain knowledge for rare diseases and complex conditions
+            medical_conditions = {
+                # Neurological
+                'multiple sclerosis': 'neurology', 'ms': 'neurology', 'parkinsons': 'neurology',
+                'alzheimers': 'neurology', 'epilepsy': 'neurology', 'migraine': 'neurology',
+                'als': 'neurology', 'huntingtons': 'neurology',
+                
+                # Autoimmune/Inflammatory
+                'rheumatoid arthritis': 'rheumatology', 'ra': 'rheumatology', 'psoriasis': 'dermatology',
+                'crohns': 'gastroenterology', 'ulcerative colitis': 'gastroenterology',
+                'lupus': 'rheumatology', 'ankylosing spondylitis': 'rheumatology',
+                
+                # Rare Diseases
+                'hemophilia': 'hematology', 'sickle cell': 'hematology', 'thalassemia': 'hematology',
+                'cystic fibrosis': 'pulmonology', 'duchenne': 'neuromuscular', 'huntingtons': 'neurology',
+                'gaucher': 'genetic medicine', 'fabry': 'genetic medicine', 'pompe': 'genetic medicine',
+                'spinal muscular atrophy': 'neuromuscular', 'sma': 'neuromuscular',
+                'mucopolysaccharidosis': 'genetic medicine', 'mps': 'genetic medicine',
+                
+                # Oncology
+                'cancer': 'oncology', 'leukemia': 'hematology-oncology', 'lymphoma': 'hematology-oncology',
+                'breast cancer': 'oncology', 'lung cancer': 'oncology', 'melanoma': 'oncology',
+                
+                # Endocrine
+                'diabetes': 'endocrinology', 'thyroid': 'endocrinology',
+                
+                # Other specialties
+                'hiv': 'infectious disease', 'hepatitis': 'hepatology'
+            }
+            
+            query_lower = query_text.lower()
+            
+            # Try AI analysis first
+            try:
+                prompt = f"""
+                Analyze this pharmaceutical market access query:
+                Query: "{query_text}"
+                
+                As a market access expert, extract key preferences for analog discovery:
+                
+                FOCUS ON MARKET ACCESS FACTORS:
+                1. Medical condition/indication (be specific - if rare disease mentioned, identify it)
+                2. Route preference (oral, injection, IV, subcutaneous)
+                3. Price tier preference (high-cost specialty vs mainstream)
+                4. Therapeutic area (neurology, rare disease, oncology, etc.)
+                5. Access complexity (simple vs complex coverage requirements)
+                
+                For rare diseases, emphasize ultra-high cost positioning and specialized access needs.
+                
+                Return JSON format:
+                {{
+                    "preferences": [
+                        {{
+                            "attribute": "indication_focus",
+                            "preference_value": "specific condition",
+                            "weight": 0.9,
+                            "rationale": "Primary condition for analog matching"
+                        }},
+                        {{
+                            "attribute": "therapeutic_area",
+                            "preference_value": "specialty area",
+                            "weight": 0.8,
+                            "rationale": "Therapeutic specialty for market access context"
+                        }},
+                        {{
+                            "attribute": "access_complexity",
+                            "preference_value": "high/medium/low",
+                            "weight": 0.7,
+                            "rationale": "Expected payer complexity"
+                        }}
+                    ]
+                }}
+                """
+                
+                response = model.generate_content(prompt)
+                response_text = response.text.strip()
+                
+                if response_text.startswith('```json'):
+                    response_text = response_text.replace('```json', '').replace('```', '').strip()
+                
+                ai_result = json.loads(response_text)
+                
+                preferences = []
+                for pref_data in ai_result.get('preferences', []):
+                    preferences.append(MarketAccessPreference(
+                        attribute=pref_data['attribute'],
+                        preference_value=pref_data['preference_value'],
+                        weight=float(pref_data['weight']),
+                        rationale=pref_data['rationale']
+                    ))
+                
+                return preferences
+                
+            except Exception as ai_error:
+                print(f"AI analysis failed: {ai_error}, using pattern matching")
+                
+                # Fallback pattern matching with enhanced rare disease support
+                preferences = []
+                
+                # Medical condition detection
+                condition_found = None
+                therapeutic_area = "general medicine"
+                
+                for condition, area in medical_conditions.items():
+                    if condition in query_lower:
+                        condition_found = condition
+                        therapeutic_area = area
+                        break
+                
+                # Special handling for "rare disease" queries
+                if 'rare disease' in query_lower or 'orphan' in query_lower:
+                    preferences.append(MarketAccessPreference(
+                        attribute="indication_focus",
+                        preference_value="rare disease",
+                        weight=0.95,
+                        rationale="Rare disease focus requires specialized market access analysis"
+                    ))
+                    preferences.append(MarketAccessPreference(
+                        attribute="access_complexity",
+                        preference_value="ultra-high",
+                        weight=0.9,
+                        rationale="Rare diseases typically have complex access pathways"
+                    ))
+                    preferences.append(MarketAccessPreference(
+                        attribute="price_tier",
+                        preference_value="ultra-high-cost",
+                        weight=0.85,
+                        rationale="Rare disease treatments are typically ultra-high cost"
+                    ))
+                elif condition_found:
+                    preferences.append(MarketAccessPreference(
+                        attribute="indication_focus",
+                        preference_value=condition_found,
+                        weight=0.9,
+                        rationale=f"Primary condition: {condition_found}"
+                    ))
+                    preferences.append(MarketAccessPreference(
+                        attribute="therapeutic_area",
+                        preference_value=therapeutic_area,
+                        weight=0.8,
+                        rationale=f"Therapeutic area: {therapeutic_area}"
+                    ))
+                
+                # Route detection
+                route_keywords = {
+                    'oral': 'oral', 'injection': 'injection', 'iv': 'intravenous', 
+                    'subcutaneous': 'subcutaneous', 'sq': 'subcutaneous'
+                }
+                
+                for keyword, route in route_keywords.items():
+                    if keyword in query_lower:
+                        preferences.append(MarketAccessPreference(
+                            attribute="route_preference",
+                            preference_value=route,
+                            weight=0.7,
+                            rationale=f"Route preference: {route}"
+                        ))
+                        break
+                
+                # Default market access focus
+                preferences.append(MarketAccessPreference(
+                    attribute="market_access_focus",
+                    preference_value="similar_payer_profile",
+                    weight=1.0,
+                    rationale="Focus on products with similar market access and payer perception"
+                ))
+                
+                return preferences
+                
+        except Exception as e:
+            print(f"Query parsing error: {e}")
+            return [
+                MarketAccessPreference(
+                    attribute="market_access_focus",
+                    preference_value="general_analysis",
+                    weight=1.0,
+                    rationale="General market access analysis"
+                )
+            ]
+    
+    def apply_primary_filtering(self, preferences: List[MarketAccessPreference]) -> List[Dict[str, Any]]:
+        """Apply primary filtering based on launch recency, indications, dosage, route, therapeutic area, class, annual WAC"""
+        
+        print("🔍 Applying Primary Filtering Criteria")
+        
+        # Start with full dataset
+        relevant_df = self.df.copy()
+        original_count = len(relevant_df)
+        
+        filtering_steps = []
+        
+        # Extract preference values
+        indication_focus = None
+        route_preference = None
+        therapeutic_area_focus = None
+        price_tier_preference = None
+        launch_recency_preference = None
+        
+        for pref in preferences:
+            if pref.attribute == "indication_focus":
+                indication_focus = pref.preference_value.lower()
+            elif pref.attribute == "route_preference":
+                route_preference = pref.preference_value.lower()
+            elif pref.attribute == "therapeutic_area":
+                therapeutic_area_focus = pref.preference_value.lower()
+            elif pref.attribute == "price_tier":
+                price_tier_preference = pref.preference_value.lower()
+            elif pref.attribute == "launch_recency":
+                launch_recency_preference = pref.preference_value.lower()
+        
+        # Step 1: Indication filtering
+        if indication_focus and indication_focus not in ['general', 'any']:
+            try:
+                # Check both main indication field and NDC indication
+                indication_mask = relevant_df['indication'].astype(str).str.lower().str.contains(
+                    indication_focus, case=False, na=False, regex=False
+                )
+                
+                filtered_df = relevant_df[indication_mask]
+                
+                if len(filtered_df) > 5:  # Sufficient results found
+                    relevant_df = filtered_df
+                    filtering_steps.append(f"Indication filter '{indication_focus}': {original_count} → {len(relevant_df)}")
+                else:
+                    # Broaden search for rare conditions
+                    broader_keywords = self._generate_broader_keywords(indication_focus)
+                    for keyword in broader_keywords:
+                        broader_mask = relevant_df['indication'].astype(str).str.lower().str.contains(
+                            keyword, case=False, na=False, regex=False
+                        )
+                        broader_filtered = relevant_df[broader_mask]
+                        if len(broader_filtered) > len(filtered_df):
+                            filtered_df = broader_filtered
+                    
+                    if len(filtered_df) > 0:
+                        relevant_df = filtered_df
+                        filtering_steps.append(f"Broadened indication filter: {original_count} → {len(relevant_df)}")
+                    else:
+                        filtering_steps.append(f"No indication matches found, using full dataset")
+                        
+            except Exception as e:
+                print(f"Indication filtering error: {e}")
+                filtering_steps.append(f"Indication filtering failed: {e}")
+        
+        # Step 2: Price tier filtering (if specific tier requested)
+        if price_tier_preference and price_tier_preference not in ['any', 'general']:
+            try:
+                if price_tier_preference == 'ultra-high-cost':
+                    price_threshold = 200000
+                    price_condition = lambda x: x > price_threshold
+                elif price_tier_preference == 'high-cost':
+                    price_threshold = 50000
+                    price_condition = lambda x: x > price_threshold
+                elif price_tier_preference == 'mid-cost':
+                    price_condition = lambda x: 5000 <= x <= 50000
+                else:
+                    price_condition = None
+                
+                if price_condition:
+                    before_count = len(relevant_df)
+                    price_filtered = []
+                    
+                    for idx in relevant_df.index:
+                        annual_wac = relevant_df.loc[idx, 'annual_WAC']
+                        price = self.safe_extract_price(annual_wac)
+                        if price > 0 and price_condition(price):
+                            price_filtered.append(idx)
+                    
+                    if len(price_filtered) > 5:
+                        relevant_df = relevant_df.loc[price_filtered]
+                        filtering_steps.append(f"Price tier filter '{price_tier_preference}': {before_count} → {len(relevant_df)}")
+                        
+            except Exception as e:
+                print(f"Price filtering error: {e}")
+                filtering_steps.append(f"Price filtering failed: {e}")
+        
+        # Step 3: Route filtering
+        if route_preference and route_preference not in ['any', 'general']:
+            try:
+                before_count = len(relevant_df)
+                route_filtered = []
+                
+                for idx in relevant_df.index:
+                    product_data = self.extract_comprehensive_product_data(relevant_df.loc[idx])
+                    product_route = product_data.get('route', '').lower()
+                    
+                    if route_preference in product_route or product_route in route_preference:
+                        route_filtered.append(idx)
+                
+                if len(route_filtered) > 5:
+                    relevant_df = relevant_df.loc[route_filtered]
+                    filtering_steps.append(f"Route filter '{route_preference}': {before_count} → {len(relevant_df)}")
+                    
+            except Exception as e:
+                print(f"Route filtering error: {e}")
+                filtering_steps.append(f"Route filtering failed: {e}")
+        
+        # If still too few results, apply fallback strategy
+        if len(relevant_df) < 10:
+            print("⚠️ Primary filtering yielded insufficient results, applying fallback")
+            relevant_df = self.df.sample(min(100, len(self.df)))
+            filtering_steps.append(f"Fallback: Using random sample of {len(relevant_df)} products")
+        
+        # Convert to products list with comprehensive data
+        products = []
+        for idx in relevant_df.index[:200]:  # Limit for performance
+            try:
+                product_dict = {}
+                for col in relevant_df.columns:
+                    product_dict[col] = relevant_df.loc[idx, col]
+                
+                # Add comprehensive analysis
+                comprehensive_data = self.extract_comprehensive_product_data(product_dict)
+                product_dict.update(comprehensive_data)
+                
+                products.append(product_dict)
+                
+            except Exception as e:
+                print(f"Error processing product at index {idx}: {e}")
+                continue
+        
+        print(f"✅ Primary filtering complete: {len(products)} products")
+        for step in filtering_steps:
+            print(f"  • {step}")
+        
+        return products
+    
+    def _generate_broader_keywords(self, indication: str) -> List[str]:
+        """Generate broader search keywords for rare or specific conditions"""
+        keyword_map = {
+            'multiple sclerosis': ['sclerosis', 'demyelinating', 'neurological'],
+            'ms': ['multiple sclerosis', 'sclerosis', 'neurological'],
+            'diabetes': ['diabetic', 'glycemic', 'insulin', 'glucose'],
+            'rare disease': ['orphan', 'genetic', 'metabolic', 'ultra-rare'],
+            'cancer': ['oncology', 'tumor', 'malignant', 'carcinoma'],
+            'arthritis': ['inflammatory', 'joint', 'rheumatoid'],
+            'hemophilia': ['bleeding', 'coagulation', 'factor'],
+            'sickle cell': ['anemia', 'hemoglobin', 'hematology']
+        }
+        
+        return keyword_map.get(indication, [indication.split()[0] if indication else ''])
+    
+    def calculate_market_access_similarity(self, reference_product: Dict[str, Any], candidate_product: Dict[str, Any]) -> float:
+        """Calculate market access similarity between products"""
+        try:
+            similarity = 0.0
+            factors = 0
+            
+            # Price tier similarity (major factor)
+            try:
+                price1 = self.safe_extract_price(reference_product.get('annual_WAC', 0))
+                price2 = self.safe_extract_price(candidate_product.get('annual_WAC', 0))
+                
+                if price1 > 0 and price2 > 0:
+                    tier1 = self.get_price_tier(price1)
+                    tier2 = self.get_price_tier(price2)
+                    
+                    if tier1 == tier2:
+                        similarity += 0.4  # Same tier
+                    elif abs(self.get_price_tier_numeric(price1) - self.get_price_tier_numeric(price2)) == 1:
+                        similarity += 0.2  # Adjacent tiers
+                    factors += 1
+            except Exception as e:
+                pass
+            
+            # Safety profile similarity
+            try:
+                boxed1 = str(reference_product.get('Is Boxed Warning', '')).lower()
+                boxed2 = str(candidate_product.get('Is Boxed Warning', '')).lower()
+                if boxed1 == boxed2:
+                    similarity += 0.3
+                    factors += 1
+            except:
+                pass
+            
+            # Route similarity
+            try:
+                ndc1 = self.extract_ndc_info(reference_product.get('ndc_data', ''))
+                ndc2 = self.extract_ndc_info(candidate_product.get('ndc_data', ''))
+                
+                route1 = str(ndc1.get('route', '')).lower()
+                route2 = str(ndc2.get('route', '')).lower()
+                
+                if route1 and route2 and route1 == route2:
+                    similarity += 0.2
+                    factors += 1
+            except:
+                pass
+            
+            # Indication similarity
+            try:
+                ind1 = str(reference_product.get('indication', '')).lower()
+                ind2 = str(candidate_product.get('indication', '')).lower()
+                
+                if ind1 and ind2:
+                    # Simple keyword overlap
+                    words1 = set(ind1.split())
+                    words2 = set(ind2.split())
+                    overlap = len(words1.intersection(words2))
+                    if overlap > 0:
+                        similarity += 0.1 * min(overlap, 1)
+                        factors += 1
+            except:
+                pass
+            
+            return self.safe_float_for_json(similarity / max(factors, 1)) if factors > 0 else 0.5
+            
+        except Exception as e:
+            print(f"Similarity calculation error: {e}")
+            return 0.5
+    
+    def safe_float_for_json(self, value: float) -> float:
+        """Ensure float value is JSON compliant"""
+        import math
+        if math.isnan(value) or math.isinf(value):
+            return 0.0
+        return max(0.0, min(1.0, value))  # Clamp between 0 and 1
+    
+    def get_price_tier(self, price) -> str:
+        """Categorize price into access tiers"""
+        try:
+            price_num = self.safe_extract_price(price)
+            if price_num <= 0:
+                return "Unknown"
+            
+            if price_num <= 5000:
+                return "Low Cost"
+            elif price_num <= 50000:
+                return "Mid Cost"
+            else:
+                return "High Cost"
+        except:
+            return "Unknown"
+    
+    def get_price_tier_numeric(self, price) -> int:
+        """Numeric price tier for comparison"""
+        try:
+            price_num = self.safe_extract_price(price)
+            if price_num <= 0:
+                return 0
+            
+            if price_num <= 5000:
+                return 1
+            elif price_num <= 50000:
+                return 2
+            else:
+                return 3
+        except:
+            return 0
+    
+    def analyze_rare_disease_potential(self, indications: List[str], annual_wac: float) -> Dict[str, Any]:
+        """Analyze if product targets rare diseases using epidemiological reasoning"""
+        rare_disease_analysis = {
+            'is_rare_disease': False,
+            'confidence': 0.0,
+            'rationale': '',
+            'epidemiological_factors': []
+        }
+        
+        # Known rare disease indicators
+        rare_disease_keywords = [
+            'sickle cell', 'hemophilia', 'duchenne', 'spinal muscular atrophy', 'sma',
+            'gaucher', 'fabry', 'pompe', 'mucopolysaccharidosis', 'mps',
+            'thalassemia', 'cystic fibrosis', 'huntingtons', 'als',
+            'multiple myeloma', 'chronic lymphocytic leukemia', 'cll',
+            'acute lymphoblastic leukemia', 'all', 'myelodysplastic syndrome',
+            'neurofibromatosis', 'tuberous sclerosis', 'von hippel-lindau',
+            'polycystic kidney disease', 'autosomal dominant', 'orphan'
+        ]
+        
+        # Ultra-rare indicators
+        ultra_rare_keywords = [
+            'prader-willi', 'angelman', 'rett syndrome', 'dravet',
+            'batten disease', 'niemann-pick', 'tay-sachs', 'canavan',
+            'leigh syndrome', 'ataxia telangiectasia', 'xeroderma pigmentosum'
+        ]
+        
+        # Analyze indications
+        indication_text = ' '.join(indications).lower() if indications else ''
+        
+        confidence = 0.0
+        factors = []
+        
+        # Check for rare disease keywords
+        for keyword in rare_disease_keywords:
+            if keyword in indication_text:
+                confidence += 0.3
+                factors.append(f"Contains rare disease indicator: '{keyword}'")
+        
+        # Check for ultra-rare keywords (higher weight)
+        for keyword in ultra_rare_keywords:
+            if keyword in indication_text:
+                confidence += 0.5
+                factors.append(f"Contains ultra-rare disease indicator: '{keyword}'")
+        
+        # Price-based analysis (epidemiological proxy)
+        if annual_wac > 500000:  # Ultra-high cost threshold
+            confidence += 0.4
+            factors.append(f"Ultra-high annual cost (${annual_wac:,.0f}) suggests very small patient population (<1,000 patients)")
+        elif annual_wac > 200000:  # High cost threshold
+            confidence += 0.3
+            factors.append(f"High annual cost (${annual_wac:,.0f}) suggests small patient population (<10,000 patients)")
+        elif annual_wac > 100000:  # Moderate-high cost
+            confidence += 0.2
+            factors.append(f"Elevated annual cost (${annual_wac:,.0f}) suggests limited patient population")
+        
+        # Therapeutic area analysis
+        specialty_areas = ['hematology', 'genetic medicine', 'neuromuscular', 'metabolic', 'oncology']
+        for area in specialty_areas:
+            if area in indication_text:
+                confidence += 0.1
+                factors.append(f"Specialty therapeutic area: {area}")
+        
+        # Complex administration suggests specialized care
+        rare_routes = ['intrathecal', 'intraventricular', 'gene therapy', 'enzyme replacement']
+        for route in rare_routes:
+            if route in indication_text:
+                confidence += 0.2
+                factors.append(f"Specialized administration: {route}")
+        
+        # Determine rare disease status
+        confidence = min(confidence, 1.0)  # Cap at 1.0
+        
+        if confidence >= 0.7:
+            rare_disease_analysis['is_rare_disease'] = True
+            rare_disease_analysis['rationale'] = "High confidence rare disease based on multiple epidemiological indicators"
+        elif confidence >= 0.4:
+            rare_disease_analysis['is_rare_disease'] = True
+            rare_disease_analysis['rationale'] = "Likely rare disease based on epidemiological analysis"
+        elif confidence >= 0.2:
+            rare_disease_analysis['is_rare_disease'] = False
+            rare_disease_analysis['rationale'] = "Possible rare disease characteristics but insufficient evidence"
+        else:
+            rare_disease_analysis['is_rare_disease'] = False
+            rare_disease_analysis['rationale'] = "Standard population disease based on available indicators"
+        
+        rare_disease_analysis['confidence'] = confidence
+        rare_disease_analysis['epidemiological_factors'] = factors
+        
+        return rare_disease_analysis
+    
+    def generate_comprehensive_payer_analysis(self, product_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate comprehensive payer analysis using all available data points"""
+        
+        analysis = {
+            'payer_considerations': [],
+            'access_barriers': [],
+            'coverage_opportunities': [],
+            'risk_factors': [],
+            'competitive_positioning': '',
+            'formulary_likelihood': 'Unknown'
+        }
+        
+        # Price-based analysis
+        annual_cost = product_data.get('annual_wac_numeric', 0)
+        if annual_cost > 0:
+            if annual_cost > 500000:
+                analysis['payer_considerations'].append(f"Ultra-high annual cost (${annual_cost:,.0f}) requires specialty pharmacy and prior authorization")
+                analysis['access_barriers'].append("Requires medical exception and outcomes-based contracts")
+                analysis['formulary_likelihood'] = 'Restrictive Tier'
+            elif annual_cost > 200000:
+                analysis['payer_considerations'].append(f"High annual cost (${annual_cost:,.0f}) requires prior authorization and step therapy")
+                analysis['access_barriers'].append("Requires clinical criteria and specialist involvement")
+                analysis['formulary_likelihood'] = 'Specialty Tier'
+            elif annual_cost > 50000:
+                analysis['payer_considerations'].append(f"Elevated annual cost (${annual_cost:,.0f}) may require step therapy")
+                analysis['coverage_opportunities'].append("Suitable for value-based contracts")
+                analysis['formulary_likelihood'] = 'Preferred Brand Tier'
+            else:
+                analysis['coverage_opportunities'].append(f"Moderate annual cost (${annual_cost:,.0f}) supports standard formulary placement")
+                analysis['formulary_likelihood'] = 'Generic/Preferred Tier'
+        
+        # Safety profile analysis
+        if product_data.get('has_boxed_warning', False):
+            analysis['access_barriers'].append("FDA boxed warning requires enhanced safety monitoring and REMS compliance")
+            analysis['risk_factors'].append("Boxed warning increases liability and restricts prescribing")
+        else:
+            analysis['coverage_opportunities'].append("No boxed warning supports favorable safety profile")
+        
+        safety_score = product_data.get('safety_score', 0)
+        if safety_score > 2.5:
+            analysis['risk_factors'].append(f"High severity adverse events (average grade {safety_score:.1f}) require monitoring")
+        elif safety_score > 0:
+            analysis['payer_considerations'].append(f"Manageable safety profile (average grade {safety_score:.1f})")
+        
+        # Administration complexity
+        route = product_data.get('route', '').lower()
+        if 'intravenous' in route or 'infusion' in route:
+            analysis['access_barriers'].append("IV administration requires medical benefit coverage and site-of-care management")
+            analysis['payer_considerations'].append("Infusion center or hospital administration increases total cost of care")
+        elif 'injection' in route or 'subcutaneous' in route:
+            analysis['payer_considerations'].append("Injectable administration may require specialty pharmacy distribution")
+        elif 'oral' in route:
+            analysis['coverage_opportunities'].append("Oral administration supports pharmacy benefit and patient convenience")
+        
+        # Therapeutic area considerations
+        therapeutic_area = product_data.get('therapeutic_area', '').lower()
+        if therapeutic_area:
+            if 'oncology' in therapeutic_area:
+                analysis['coverage_opportunities'].append("Oncology indication typically receives favorable coverage consideration")
+            elif 'rare' in therapeutic_area or 'genetic' in therapeutic_area:
+                analysis['coverage_opportunities'].append("Rare disease status may qualify for orphan drug considerations")
+            elif 'neurology' in therapeutic_area:
+                analysis['payer_considerations'].append("Neurological conditions often require specialist oversight")
+        
+        # Launch recency impact
+        launch_recency = product_data.get('launch_recency', '')
+        if launch_recency == 'Recent':
+            analysis['access_barriers'].append("Recent launch may face payer skepticism pending real-world evidence")
+            analysis['competitive_positioning'] = 'New market entrant requiring differentiation'
+        elif launch_recency == 'Established':
+            analysis['coverage_opportunities'].append("Established product with likely payer familiarity")
+            analysis['competitive_positioning'] = 'Market-established with proven track record'
+        
+        # Multi-indication advantage
+        if product_data.get('is_multi_indication', False):
+            analysis['coverage_opportunities'].append("Multiple indications provide broader coverage justification")
+            analysis['competitive_positioning'] = 'Versatile therapy with broad clinical utility'
+        
+        # Regulatory pathway implications
+        regulatory_pathway = product_data.get('regulatory_pathway', '')
+        if regulatory_pathway == '505(b)(2)':
+            analysis['payer_considerations'].append("505(b)(2) pathway suggests incremental innovation over existing therapy")
+        elif regulatory_pathway == 'NDA':
+            analysis['coverage_opportunities'].append("Full NDA pathway indicates comprehensive clinical development")
+        
+        # Rare disease analysis
+        indications = product_data.get('indications', [])
+        rare_analysis = self.analyze_rare_disease_potential(indications, annual_cost)
+        
+        if rare_analysis['is_rare_disease']:
+            analysis['coverage_opportunities'].append(f"Rare disease characteristics: {rare_analysis['rationale']}")
+            analysis['payer_considerations'].extend([f"• {factor}" for factor in rare_analysis['epidemiological_factors']])
+            if rare_analysis['confidence'] > 0.7:
+                analysis['formulary_likelihood'] = 'Specialty/Medical Benefit'
+        
+        return analysis
+
+# Initialize market access intelligence
+access_intel = MarketAccessIntelligence(dataset_intel)
+
+# --- API Endpoints - 7 Stage Workflow ---
+@api_router.get("/")
+async def root():
+    return {
+        "message": "Intelligent Market Access Analog Agent - 7 Stage Workflow",
+        "dataset_products": len(dataset_intel.df) if dataset_intel.df is not None else 0,
+        "status": "ready"
+    }
+
+@api_router.post("/session/start")
+async def create_session():
+    """Create a new market access analog session"""
+    session = AnalogSession()
+    await db.sessions.insert_one(session.dict())
+    return {
+        "session_id": session.session_id,
+        "stage": session.stage,
+        "message": "New market access analog session created"
+    }
+
+@api_router.post("/session/{session_id}/reset")
+async def reset_session(session_id: str):
+    """Reset session to start fresh search"""
+    try:
+        session_doc = await db.sessions.find_one({"session_id": session_id})
+        if not session_doc:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Reset to initial state but keep session_id
+        reset_session = AnalogSession(session_id=session_id)
+        await db.sessions.replace_one(
+            {"session_id": session_id},
+            reset_session.dict()
+        )
+        
+        return {
+            "session_id": session_id,
+            "stage": reset_session.stage,
+            "message": "Session reset successfully - ready for new search"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Session reset failed: {str(e)}")
+
+@api_router.post("/session/{session_id}/stage1-intent-alignment")
+async def stage1_intent_alignment(session_id: str, query: MarketAccessQuery):
+    """Stage 1: Intelligent market access intent alignment"""
+    try:
+        session_doc = await db.sessions.find_one({"session_id": session_id})
+        if not session_doc:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        session = AnalogSession(**session_doc)
+        
+        print(f"🎯 Stage 1: Processing intent alignment for query: '{query.query_text}'")
+        
+        # Intelligent query parsing with market access focus
+        preferences = await access_intel.parse_intelligent_query(query.query_text)
+        
+        # Update session
+        session.queries.append(query.dict())
+        session.market_access_preferences = [pref.dict() for pref in preferences]
+        session.stage = Stage.STAGE_2_DATA_RETRIEVAL
+        session.updated_at = datetime.utcnow()
+        
+        await db.sessions.replace_one({"session_id": session_id}, session.dict())
+        
+        return {
+            "session_id": session_id,
+            "stage": session.stage,
+            "query": query.query_text,
+            "market_access_preferences": [pref.dict() for pref in preferences],
+            "message": f"Intent aligned with {len(preferences)} market access preferences"
+        }
+        
+    except Exception as e:
+        print(f"Stage 1 error: {e}")
+        raise HTTPException(status_code=500, detail=f"Intent alignment failed: {str(e)}")
+
+@api_router.post("/session/{session_id}/stage2-data-retrieval")
+async def stage2_data_retrieval(session_id: str):
+    """Stage 2: Intelligent data retrieval with market access filtering"""
+    try:
+        session_doc = await db.sessions.find_one({"session_id": session_id})
+        if not session_doc:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        session = AnalogSession(**session_doc)
+        
+        if not session.market_access_preferences:
+            raise HTTPException(status_code=400, detail="No preferences found - run Stage 1 first")
+        
+        print(f"📊 Stage 2: Retrieving candidates with market access intelligence")
+        
+        # Convert preferences back to objects
+        preferences = [MarketAccessPreference(**p) for p in session.market_access_preferences]
+        
+        # Find relevant products using intelligent filtering
+        candidates = access_intel.apply_primary_filtering(preferences)
+        
+        # Update session
+        session.candidate_count = len(candidates)
+        session.stage = Stage.STAGE_3_INITIAL_RANKING
+        session.updated_at = datetime.utcnow()
+        
+        await db.sessions.replace_one({"session_id": session_id}, session.dict())
+        
+        return {
+            "session_id": session_id,
+            "stage": session.stage,
+            "candidate_count": len(candidates),
+            "message": f"Retrieved {len(candidates)} relevant candidates for market access analysis"
+        }
+        
+    except Exception as e:
+        print(f"Stage 2 error: {e}")
+        raise HTTPException(status_code=500, detail=f"Data retrieval failed: {str(e)}")
+
+@api_router.post("/session/{session_id}/stage3-initial-ranking")
+async def stage3_initial_ranking(session_id: str):
+    """Stage 3: Generate initial market access similarity rankings"""
+    try:
+        session_doc = await db.sessions.find_one({"session_id": session_id})
+        if not session_doc:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        session = AnalogSession(**session_doc)
+        
+        if not session.market_access_preferences:
+            raise HTTPException(status_code=400, detail="No preferences found")
+        
+        print(f"🔄 Stage 3: Generating initial market access rankings")
+        
+        # Recreate preferences and find products
+        preferences = [MarketAccessPreference(**p) for p in session.market_access_preferences]
+        candidates = access_intel.apply_primary_filtering(preferences)
+        
+        # Generate comprehensive rankings based on market access similarity
+        rankings = []
+        reference_product = candidates[0] if candidates else None
+        
+        for candidate in candidates[:20]:  # Top 20 for initial ranking
+            try:
+                # Extract comprehensive product data
+                comprehensive_data = access_intel.extract_comprehensive_product_data(candidate)
+                
+                # Calculate market access similarity
+                raw_similarity = access_intel.calculate_market_access_similarity(reference_product, candidate) if reference_product else 0.5
+                similarity = access_intel.safe_float_for_json(raw_similarity)
+                
+                # Generate comprehensive payer analysis
+                payer_analysis = access_intel.generate_comprehensive_payer_analysis(comprehensive_data)
+                
+                # Generate detailed market access reasoning
+                price = comprehensive_data.get('annual_wac_numeric', 0)
+                tier = access_intel.get_price_tier(price)
+                
+                reasoning_parts = [
+                    f"Market access similarity {similarity:.0%}: {tier} positioning"
+                ]
+                
+                if price > 0:
+                    reasoning_parts.append(f"Annual cost: ${price:,.0f}")
+                
+                # Add therapeutic insights
+                if comprehensive_data.get('therapeutic_area'):
+                    reasoning_parts.append(f"Therapeutic area: {comprehensive_data['therapeutic_area']}")
+                
+                if comprehensive_data.get('route'):
+                    reasoning_parts.append(f"Route: {comprehensive_data['route']}")
+                
+                # Add rare disease analysis if applicable
+                rare_analysis = access_intel.analyze_rare_disease_potential(
+                    comprehensive_data.get('indications', []), 
+                    price
+                )
+                if rare_analysis['is_rare_disease']:
+                    reasoning_parts.append(f"Rare disease profile: {rare_analysis['rationale']}")
+                
+                reasoning = ". ".join(reasoning_parts)
+                
+                # Key attributes from comprehensive data
+                key_attrs = {
+                    'brand_name': comprehensive_data.get('brand_name', 'Unknown'),
+                    'generic_name': comprehensive_data.get('generic_name', 'Not specified'),
+                    'indication': ', '.join(comprehensive_data.get('indications', ['Not specified'])),
+                    'annual_wac': f"${price:,.0f}" if price > 0 else "Not available",
+                    'price_tier': tier,
+                    'route': comprehensive_data.get('route', 'Not specified'),
+                    'dosage_form': comprehensive_data.get('dosage_form', 'Not specified'),
+                    'therapeutic_area': comprehensive_data.get('therapeutic_area', 'Not specified'),
+                    'launch_recency': comprehensive_data.get('launch_recency', 'Unknown'),
+                    'safety_score': f"{comprehensive_data.get('safety_score', 0):.1f}" if comprehensive_data.get('safety_score', 0) > 0 else "Not assessed",
+                    'regulatory_pathway': comprehensive_data.get('regulatory_pathway', 'Unknown')
+                }
+                
+                # Create ranking dictionary
+                ranking = {
+                    'product_id': str(candidate.get('brand_name', len(rankings))),
+                    'brand_name': str(comprehensive_data.get('brand_name', 'Unknown')),
+                    'market_access_similarity': similarity,
+                    'access_reasoning': reasoning,
+                    'key_attributes': key_attrs,
+                    'payer_considerations': payer_analysis['payer_considerations'],
+                    'access_barriers': payer_analysis['access_barriers'],
+                    'coverage_opportunities': payer_analysis['coverage_opportunities'],
+                    'formulary_likelihood': payer_analysis['formulary_likelihood'],
+                    'comprehensive_analysis': payer_analysis
+                }
+                
+                rankings.append(ranking)
+                
+            except Exception as e:
+                print(f"Error ranking product: {e}")
+                continue
+        
+        # Sort by similarity
+        rankings.sort(key=lambda x: x['market_access_similarity'], reverse=True)
+        
+        # Update session
+        session.initial_rankings = rankings  # rankings are already dictionaries
+        session.ranking_rationale = f"Generated {len(rankings)} market access analog rankings based on similarity analysis"
+        session.stage = Stage.STAGE_4_FEEDBACK_LOOP_1
+        session.updated_at = datetime.utcnow()
+        
+        await db.sessions.replace_one({"session_id": session_id}, session.dict())
+        
+        return {
+            "session_id": session_id,
+            "stage": session.stage,
+            "initial_rankings": rankings,  # rankings are already dictionaries
+            "ranking_rationale": session.ranking_rationale,
+            "total_ranked": len(rankings),
+            "message": "Initial market access rankings generated successfully"
+        }
+        
+    except Exception as e:
+        print(f"Stage 3 error: {e}")
+        raise HTTPException(status_code=500, detail=f"Initial ranking failed: {str(e)}")
+
+@api_router.post("/session/{session_id}/stage4-feedback")
+async def stage4_feedback_loop(session_id: str, feedback: Dict[str, Any] = Body(...)):
+    """Stage 4: Process user feedback for refinement"""
+    try:
+        session_doc = await db.sessions.find_one({"session_id": session_id})
+        if not session_doc:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        session = AnalogSession(**session_doc)
+        
+        # Process user selections and rejections
+        user_selections = feedback.get('selections', [])
+        user_rejections = feedback.get('rejections', [])
+        
+        session.user_selections.extend(user_selections)
+        session.user_rejections.extend(user_rejections)
+        session.stage = Stage.STAGE_5_SECONDARY_REFINEMENT
+        session.updated_at = datetime.utcnow()
+        
+        await db.sessions.replace_one({"session_id": session_id}, session.dict())
+        
+        return {
+            "session_id": session_id,
+            "stage": session.stage,
+            "user_selections": session.user_selections,
+            "user_rejections": session.user_rejections,
+            "message": f"Processed feedback: {len(user_selections)} selections, {len(user_rejections)} rejections"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Feedback processing failed: {str(e)}")
+
+@api_router.post("/session/{session_id}/stage5-refinement")
+async def stage5_secondary_refinement(session_id: str):
+    """Stage 5: Secondary refinement based on user feedback"""
+    try:
+        session_doc = await db.sessions.find_one({"session_id": session_id})
+        if not session_doc:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        session = AnalogSession(**session_doc)
+        
+        # Filter rankings based on user feedback
+        refined_rankings = []
+        for ranking_dict in session.initial_rankings:
+            brand_name = ranking_dict.get('brand_name', '')
+            
+            # Skip rejected products
+            if brand_name in session.user_rejections:
+                continue
+            
+            # Boost selected products
+            if brand_name in session.user_selections:
+                ranking_dict['market_access_similarity'] = min(1.0, ranking_dict['market_access_similarity'] + 0.1)
+                ranking_dict['access_reasoning'] += " (User selected - boosted priority)"
+            
+            refined_rankings.append(ranking_dict)
+        
+        # Re-sort
+        refined_rankings.sort(key=lambda x: x['market_access_similarity'], reverse=True)
+        
+        session.initial_rankings = refined_rankings
+        session.stage = Stage.STAGE_6_FINAL_SELECTION
+        session.updated_at = datetime.utcnow()
+        
+        await db.sessions.replace_one({"session_id": session_id}, session.dict())
+        
+        return {
+            "session_id": session_id,
+            "stage": session.stage,
+            "refined_rankings": refined_rankings[:15],  # Top 15
+            "message": f"Refined to {len(refined_rankings)} analogs based on your feedback"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Secondary refinement failed: {str(e)}")
+
+@api_router.post("/session/{session_id}/stage6-final-selection")
+async def stage6_final_selection(session_id: str, final_selections: Dict[str, List[str]] = Body(...)):
+    """Stage 6: Process final user selections"""
+    try:
+        session_doc = await db.sessions.find_one({"session_id": session_id})
+        if not session_doc:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        session = AnalogSession(**session_doc)
+        
+        final_products = final_selections.get('selected_products', [])
+        session.user_selections = final_products
+        session.stage = Stage.STAGE_7_FINAL_ANALYSIS
+        session.updated_at = datetime.utcnow()
+        
+        await db.sessions.replace_one({"session_id": session_id}, session.dict())
+        
+        return {
+            "session_id": session_id,
+            "stage": session.stage,
+            "final_selections": final_products,
+            "message": f"Final selection of {len(final_products)} products confirmed"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Final selection failed: {str(e)}")
+
+@api_router.post("/session/{session_id}/stage7-final-analysis")
+async def stage7_final_analysis(session_id: str):
+    """Stage 7: Generate comprehensive market access insights"""
+    try:
+        session_doc = await db.sessions.find_one({"session_id": session_id})
+        if not session_doc:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        session = AnalogSession(**session_doc)
+        
+        # Generate comprehensive insights
+        selected_products = [r for r in session.initial_rankings if r.get('brand_name') in session.user_selections]
+        
+        insights = f"""
+MARKET ACCESS ANALOG ANALYSIS SUMMARY
+
+Selected Analogs: {len(selected_products)}
+Total Candidates Analyzed: {session.candidate_count}
+
+MARKET ACCESS INSIGHTS:
+• Price tier distribution across selected analogs
+• Common payer challenges and opportunities  
+• Access complexity assessment
+• Competitive positioning implications
+
+RECOMMENDATIONS:
+• Strategic positioning for similar market access profile
+• Key differentiation opportunities
+• Payer engagement priorities
+        """.strip()
+        
+        session.final_insights = insights
+        session.updated_at = datetime.utcnow()
+        
+        await db.sessions.replace_one({"session_id": session_id}, session.dict())
+        
+        return {
+            "session_id": session_id,
+            "stage": session.stage,
+            "selected_analogs": selected_products,
+            "market_access_insights": insights,
+            "message": "Comprehensive market access analysis completed"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Final analysis failed: {str(e)}")
+
+@api_router.post("/analog-discovery-simple")
+async def analog_discovery_simple(request: Dict[str, Any] = Body(...)):
+    """Temporary simplified endpoint for backward compatibility"""
+    try:
+        query_text = request.get('query', '')
+        user_overrides = request.get('user_overrides', {})
+        
+        print(f"🔍 Simple analog discovery for: '{query_text}'")
+        
+        # Create temporary session for this request
+        temp_session = AnalogSession()
+        
+        # Parse query with market access intelligence
+        preferences = await access_intel.parse_intelligent_query(query_text)
+        
+        # Find relevant products using comprehensive filtering
+        candidates = access_intel.apply_primary_filtering(preferences)
+        
+        # Generate rankings
+        analogs_found = []
+        reference_product = candidates[0] if candidates else None
+        
+        for candidate in candidates[:10]:  # Top 10 results
+            try:
+                similarity = access_intel.safe_float_for_json(
+                    access_intel.calculate_market_access_similarity(reference_product, candidate) if reference_product else 0.5
+                )
+                
+                # Generate access reasoning
+                price = access_intel.safe_extract_price(candidate.get('annual_WAC', 0))
+                tier = access_intel.get_price_tier(price)
+                
+                reasoning = f"Market access similarity based on {tier.lower()} positioning"
+                if price > 0:
+                    reasoning += f" with ${price:,.0f} annual cost"
+                
+                # Key attributes
+                key_attrs = {
+                    'brand_name': candidate.get('brand_name', 'Unknown'),
+                    'indication': candidate.get('indication', 'Not specified'),
+                    'annual_wac': f"${price:,.0f}" if price > 0 else "Not available",
+                    'price_tier': tier
+                }
+                
+                # Add NDC info
+                ndc_info = access_intel.extract_ndc_info(candidate.get('ndc_data', ''))
+                key_attrs.update({k: v for k, v in ndc_info.items() if v})
+                
+                # Comprehensive payer analysis
+                comprehensive_data = access_intel.extract_comprehensive_product_data(candidate)
+                payer_analysis = access_intel.generate_comprehensive_payer_analysis(comprehensive_data)
+                payer_considerations = payer_analysis['payer_considerations']
+                
+                analog = {
+                    'brand_name': str(candidate.get('brand_name', 'Unknown')),
+                    'similarity_score': similarity,
+                    'access_reasoning': reasoning,
+                    'key_attributes': key_attrs,
+                    'payer_considerations': payer_considerations
+                }
+                
+                analogs_found.append(analog)
+                
+            except Exception as e:
+                print(f"Error processing analog: {e}")
+                continue
+        
+        # Sort by similarity
+        analogs_found.sort(key=lambda x: x['similarity_score'], reverse=True)
+        
+        return {
+            'query_understanding': f"Analyzing '{query_text}' for market access analog discovery",
+            'analogs_found': analogs_found,
+            'market_access_insights': f"Found {len(analogs_found)} analogs with market access similarity analysis",
+            'user_guidance': "This is a simplified view. Use the 7-stage workflow for comprehensive analysis.",
+            'data_sources': ['pharmaceutical_dataset.xlsx']
+        }
+        
+    except Exception as e:
+        print(f"Simple analog discovery error: {e}")
+        raise HTTPException(status_code=500, detail=f"Analog discovery failed: {str(e)}")
+
+@api_router.get("/session/{session_id}")
+async def get_session_status(session_id: str):
+    """Get current session status and data"""
+    session_doc = await db.sessions.find_one({"session_id": session_id})
+    if not session_doc:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    return session_doc
+
+# Include the router in the main app
+app.include_router(api_router)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)
